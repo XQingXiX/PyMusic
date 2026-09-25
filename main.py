@@ -257,6 +257,31 @@ def find_matching_lyrics(song_path):
     return ""
 
 
+# 歌曲附属文件（封面 / 歌词）会随歌曲一起被重命名或删除：api.py 下载封面时
+# 按图片魔数写 .jpg/.png/.bmp/.webp，歌词写 .lrc，覆盖前还会把旧文件轮换成
+# <文件名>.bak1/.bak2（见 api._rotate_backup）。这里集中列出这些候选后缀。
+_SIDECAR_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".lrc")
+
+
+def _associated_sidecar_paths(song_path):
+    """返回与歌曲同名的附属文件（封面/歌词 + 其 .bak1/.bak2 备份）路径列表。
+
+    只做"精确同名"匹配，避免误伤同目录下名称恰好前后缀相同的其它文件。
+    同时覆盖 <歌名>.<后缀> 与 <完整文件名>.<后缀> 两种命名
+    （后者对应 find_matching_image 的 "song.mp3.jpg" 情形）。
+    """
+    song_path = _to_path(song_path)
+    directory = song_path.parent
+    bases = {song_path.stem, song_path.name}
+    paths = []
+    for base in bases:
+        for ext in _SIDECAR_EXTS:
+            paths.append(directory / (base + ext))
+            paths.append(directory / (base + ext + ".bak1"))
+            paths.append(directory / (base + ext + ".bak2"))
+    return paths
+
+
 def _looks_like_jpeg(path):
     """检查文件是否以 JPEG 魔数 (FF D8) 开头"""
     try:
@@ -626,6 +651,43 @@ def build_song_name(song_path):
     return song_path.stem
 
 
+def write_title_tag(song_path, title):
+    """用 ffmpeg 改写音频文件的内嵌标题标签（保留作者等其它标签）。
+
+    重命名歌曲时调用：列表显示名优先取内嵌标签（build_song_name），
+    只改文件名不会改变显示名，因此把新名字写进标题标签，使列表持久生效。
+    采用 `-c copy` 仅重封装、不重编码，先写临时文件再原子替换，避免
+    写失败损坏原文件。成功返回 True。
+    """
+    song_path = _to_path(song_path)
+    tmp_path = song_path.with_name(song_path.stem + ".pymusic_tmp" + song_path.suffix)
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-i", str(song_path),
+             "-c", "copy",
+             "-metadata", "title=" + title,
+             str(tmp_path)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0 or not tmp_path.is_file():
+            if tmp_path.is_file():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            return False
+        os.replace(str(tmp_path), str(song_path))
+        return True
+    except Exception:
+        if tmp_path.is_file():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        return False
+
+
 class _TaskSignals(QObject):
     """后台任务完成信号：finished(task_id, ok, result)。"""
     finished = Signal(int, bool, object)
@@ -941,6 +1003,171 @@ class AudioPlayer(QObject):
             self.musicDirChanged.emit()
             self._start_metadata_enrichment()
         return True
+
+    def _reload_songs(self, keep_path=None):
+        """重新扫描音乐目录并恢复当前播放歌曲（重命名/删除文件后刷新列表）。
+
+        与 _sort_songs 不同：先把 current_index 清成 -1 再扫描、排序，避免
+        用旧下标去新列表里按路径"恢复"到错误的歌上；排序完成后再按 keep_path
+        定位（重命名后传新路径，删除其它歌时传当前歌的旧路径）。
+        """
+        self._current_index = -1
+        self._songs = scan_music(self._music_dir)
+        self._song_list_model_cache = None
+        self._sort_songs()
+        if keep_path:
+            for i, song in enumerate(self._songs):
+                if song["path"] == keep_path:
+                    self._current_index = i
+                    self.songChanged.emit(i)
+                    break
+
+    def _write_scan_cache(self):
+        """把当前歌曲列表写入扫描缓存（重命名/删除后调用）。
+
+        正常情况下 scan_music 已会写缓存；这里显式再写一次，确保改名/删除
+        后的最新文件名落盘，避免下次启动命中旧缓存而"找不到歌曲"。
+        """
+        try:
+            audio_names, image_names = _list_dir_names(self._music_dir)
+            _save_scan_cache(_scan_cache_path(self._music_dir),
+                             audio_names, image_names, self._songs)
+        except Exception:
+            pass
+
+    @Slot(int, str, result=bool)
+    def renameSong(self, index, new_name):
+        """把第 index 首歌曲及其封面/歌词（含 .bakN 备份）重命名为 new_name。
+
+        new_name 不含扩展名，扩展名保留原样。目标已存在或名称非法时返回
+        False 且不做任何改动。重命名后重新扫描目录，列表实时刷新。
+        """
+        if not (0 <= index < len(self._songs)):
+            return False
+        new_name = (new_name or "").strip()
+        if not new_name or new_name in (".", "..") \
+                or "/" in new_name or "\\" in new_name or "\0" in new_name:
+            return False
+
+        old_path = _to_path(self._songs[index]["path"])
+        old_path_str = self._songs[index]["path"]
+        if not old_path.is_file():
+            return False
+        new_audio = old_path.with_name(new_name + old_path.suffix)
+        if new_audio == old_path:
+            return True
+        if new_audio.exists():
+            return False
+
+        # 汇总所有需要一起改名的文件：先算好目标路径并检查冲突，
+        # 全部合法后再统一执行，避免改到一半失败留下半套文件。
+        moves = [(old_path, new_audio)]
+        for sidecar in _associated_sidecar_paths(old_path):
+            if not sidecar.is_file():
+                continue
+            suffix = sidecar.name[len(old_path.stem):]
+            target = new_audio.parent / (new_name + suffix)
+            if target == sidecar:
+                continue
+            if target.exists():
+                return False
+            moves.append((sidecar, target))
+
+        was_current = (index == self._current_index)
+        current_path = None
+        if 0 <= self._current_index < len(self._songs):
+            current_path = self._songs[self._current_index]["path"]
+
+        try:
+            for src, dst in moves:
+                src.rename(dst)
+        except OSError:
+            return False
+
+        # 只改文件名不会改变列表显示名（build_song_name 优先取内嵌标签），
+        # 因此把新名字同步写进标题标签，让列表与左侧曲名都持久生效。
+        if not write_title_tag(new_audio, new_name):
+            _log("重命名", "write_title_tag 失败（保持文件名已改）：%s" % new_audio)
+
+        # 正在播放的是被改名这首：跟随到新路径；否则保持当前歌不变。
+        keep_path = str(new_audio) if was_current else current_path
+        self._reload_songs(keep_path)
+        if was_current:
+            # LRC/封面文件名变了，重新按新路径加载歌词
+            self._load_lyrics()
+        # 重新扫描后名字回退为文件名，后台补全元数据（标题/作者）再刷新
+        self._start_metadata_enrichment()
+        # 把改名结果写入扫描缓存，避免下次启动命中旧缓存找不到该曲
+        self._write_scan_cache()
+        # 若配置里记录的"上次播放歌曲"正是被改名这首，同步更新为新路径，
+        # 否则重启后 restoreLastPosition 按旧路径找不到该曲
+        if self.loadSettings().get("lastFile", "") == old_path_str:
+            self.saveSetting("lastFile", str(new_audio))
+        return True
+
+    @Slot(int, result=bool)
+    def deleteSong(self, index):
+        """删除第 index 首歌及其封面/歌词（含 .bakN 备份），返回是否成功。
+
+        会弹出确认框由 QML 负责；删除正在播放的歌时先停止播放。删除后
+        重新扫描目录，列表实时刷新。
+        """
+        if not (0 <= index < len(self._songs)):
+            return False
+        path = _to_path(self._songs[index]["path"])
+        was_current = (index == self._current_index)
+        song_total = len(self._songs)
+        current_path = None
+        if 0 <= self._current_index < song_total:
+            current_path = self._songs[self._current_index]["path"]
+
+        # 删除的是当前播放歌曲时，先记下删除后要接续播放的"下一首"路径：
+        # 删除后列表整体前移，原 index+1 处即新列表的下一首；删除的是最后
+        # 一首则回到第一首。记录路径而非下标，避免重扫后错位。
+        next_path = None
+        if was_current and song_total > 1:
+            next_path = self._songs[index + 1]["path"] if index + 1 < song_total \
+                else self._songs[0]["path"]
+
+        if was_current:
+            self._kill_process()
+            self._state = "stopped"
+            self.stateChanged.emit("stopped")
+            self._position = 0.0
+            self.positionChanged.emit(0.0)
+            self._lyrics = []
+            self._current_lyric_index = -1
+            self.lyricsChanged.emit()
+            self.lyricIndexChanged.emit(-1)
+
+        files = [path] + [p for p in _associated_sidecar_paths(path) if p.is_file()]
+        ok = True
+        for f in files:
+            try:
+                f.unlink()
+            except OSError:
+                ok = False
+
+        self._reload_songs(None if was_current else current_path)
+        self._start_metadata_enrichment()
+        # 删除结果写入扫描缓存，避免下次启动命中旧缓存找不到该曲
+        self._write_scan_cache()
+        # 配置里记录的"上次播放歌曲"若正是被删这首，改为接续的下一首
+        # （没有下一首则清空），否则重启时按失效路径找不到歌曲
+        if self.loadSettings().get("lastFile", "") == str(path):
+            self.saveSetting("lastFile", next_path or "")
+
+        # 删除当前歌曲后自动接续播放下一首（列表已刷新，按路径重新定位）
+        if next_path:
+            for i, song in enumerate(self._songs):
+                if song["path"] == next_path:
+                    self._current_index = i
+                    self._position = 0.0
+                    self.songChanged.emit(i)
+                    self.positionChanged.emit(0.0)
+                    self.play()
+                    break
+        return ok
 
     # ========== 当前播放索引 ==========
 
@@ -1289,13 +1516,20 @@ class AudioPlayer(QObject):
         if not ok:
             return
         changed = False
+        current_name_changed = False
         for i, path, name in result:
             if 0 <= i < len(self._songs) and self._songs[i]["path"] == path \
                     and name and self._songs[i]["name"] != name:
                 self._songs[i]["name"] = name
                 changed = True
+                if i == self._current_index:
+                    current_name_changed = True
         if changed:
             self._sort_songs()
+            # 当前歌曲显示名也变了：补发 songChanged，否则 currentSongName
+            # （notify=songChanged）不会刷新，左侧曲名与列表会不一致。
+            if current_name_changed:
+                self.songChanged.emit(self._current_index)
 
     # ========== ffplay 进程管理 ==========
 

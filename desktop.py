@@ -42,6 +42,7 @@ Wayland 说明:
 
 import os
 import sys
+import json
 import shutil
 import subprocess
 import tempfile
@@ -102,6 +103,107 @@ def _use_layer_shell_mode():
               "SHELL=1（层窗口不可拖动，默认普通窗口）")
         return False
     return True
+
+
+def _is_hyprland():
+    """是否运行在 Hyprland（Wayland）下。"""
+    if QGuiApplication.platformName() != "wayland":
+        return False
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return True
+    return "Hyprland" in os.environ.get("XDG_CURRENT_DESKTOP", "")
+
+
+class _HyprlandFloater:
+    """Hyprland 下把桌面歌词窗口切换为浮动。
+
+    Hyprland 是平铺合成器，普通窗口默认会被平铺；而 Wayland 协议不允许
+    客户端自己请求浮动，只能借道 Hyprland 的 hyprctl：
+      - `hyprctl -j clients` 列出所有窗口（含 pid/title/class/floating）；
+      - 按"本进程 pid + 标题"定位桌面歌词窗口；
+      - 未浮动则 `hyprctl dispatch setfloating address:<addr>`，旧版
+        没有该 dispatcher 时回退 `togglefloating`。
+    窗口 show 后需几百毫秒才被合成器注册，调用方负责延迟重试。
+    """
+
+    def __init__(self, title, class_hint):
+        self._title = title or ""
+        self._class = (class_hint or "").lower()
+
+    @staticmethod
+    def is_hyprland():
+        return _is_hyprland()
+
+    def _clients(self):
+        try:
+            r = subprocess.run(["hyprctl", "-j", "clients"],
+                               capture_output=True, text=True, timeout=3)
+            if r.returncode != 0 or not r.stdout.strip():
+                _dlog("_HyprlandFloater._clients: hyprctl 返回 rc=%s" % r.returncode)
+                return None
+            return json.loads(r.stdout)
+        except Exception as e:
+            _dlog("_HyprlandFloater._clients 异常: %r" % (e,))
+            return None
+
+    def ensure_floating(self):
+        """把本进程的桌面歌词窗口设为浮动；成功或已浮动返回 True。"""
+        if not self.is_hyprland():
+            return False
+        clients = self._clients()
+        if clients is None:
+            return False
+        pid = os.getpid()
+        target = None
+        for c in clients:
+            try:
+                if int(c.get("pid", -1)) != pid:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            title = c.get("title") or ""
+            cls = ((c.get("class") or "") + " " + (c.get("initialClass") or "")).lower()
+            if (self._title and self._title in title) \
+                    or (self._class and self._class in cls):
+                target = c
+                break
+        if target is None:
+            _dlog("_HyprlandFloater.ensure_floating: 未找到本进程的桌面歌词窗口")
+            return False
+        if target.get("floating"):
+            _dlog("_HyprlandFloater.ensure_floating: 窗口已是浮动，无需处理")
+            return True
+        addr = target.get("address")
+        if not addr:
+            return False
+        # 依次尝试：
+        # 1) 新版 Lua 配置（Hyprland 0.56+）：dispatcher 为 hl.dsp.window.float，
+        #    必须经 hl.dispatch() 执行；用字符串式 dispatch 会报 Lua 解析错误。
+        # 2) 旧版字符串 dispatcher：setfloating（较新）→ togglefloating（兜底）。
+        # 已确认窗口未浮动，故 togglefloating 不会把它平铺掉。
+        eval_code = ("hl.dispatch(hl.dsp.window.float({ action='set', "
+                     "window='address:%s' }))" % addr)
+        candidates = (
+            ["hyprctl", "eval", eval_code],
+            ["hyprctl", "dispatch", "setfloating", "address:" + addr],
+            ["hyprctl", "dispatch", "togglefloating", "address:" + addr],
+        )
+        for args in candidates:
+            try:
+                r = subprocess.run(args, capture_output=True, text=True, timeout=3)
+            except Exception as e:
+                _dlog("_HyprlandFloater.ensure_floating: %s 异常 %r" % (args[1:3], e))
+                continue
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
+            low = out.lower()
+            if r.returncode == 0 and "error" not in low \
+                    and "invalid" not in low and "unknown" not in low:
+                _dlog("_HyprlandFloater.ensure_floating: %s -> %s"
+                      % (args[1:3], out))
+                return True
+            _dlog("_HyprlandFloater.ensure_floating: %s 失败 rc=%s out=%r"
+                  % (args[1:3], r.returncode, out))
+        return False
 
 
 # 普通窗口置顶：KWin 脚本按标题匹配窗口，设置 keepAbove。
@@ -508,6 +610,8 @@ class _LyricBridge(QObject):
     indexChanged = Signal(int)
     stateChanged = Signal()
     lyricsChanged = Signal()
+    volumeChanged = Signal()
+    lockedChanged = Signal()
 
     def __init__(self, player, parent=None):
         super().__init__(parent)
@@ -517,12 +621,21 @@ class _LyricBridge(QObject):
         self._desktop_font = ""   # 桌面歌词字体族（空=默认）
         self._desktop_color = ""  # 桌面歌词当前行颜色（空=默认白）
         self._drag_mode = "system"  # "system"=普通窗口拖动 / "none"=层窗口不可拖动
+        self._locked = False       # "锁定歌词"状态（锁定时不响应滚轮调音量）
+
+        # 滚轮音量：40ms 防抖合并连续滚动，避免快速滚动丢步与频繁写 pactl
+        self._pending_volume = None
+        self._wheel_timer = QTimer(self)
+        self._wheel_timer.setSingleShot(True)
+        self._wheel_timer.setInterval(40)
+        self._wheel_timer.timeout.connect(self._flush_volume)
 
         if player is not None:
             player.lyricsChanged.connect(self._on_lyrics_changed)
             # 与主播放器使用同一"带提前量"索引，保证两句永远同步
             player.lyricIndexChanged.connect(self._on_index_changed)
             player.stateChanged.connect(self._on_state_changed)
+            player.volumeChanged.connect(self._on_volume_changed)
             self._on_lyrics_changed()
 
     # ---------- 与 AudioPlayer 的同步 ----------
@@ -561,6 +674,65 @@ class _LyricBridge(QObject):
 
     def _on_state_changed(self, state):
         self.stateChanged.emit()
+
+    def _on_volume_changed(self, *args):
+        self.volumeChanged.emit()
+
+    # ---------- 滚轮调节音量（非锁定状态下由 QML WheelHandler 调用） ----------
+
+    @Property(int, notify=volumeChanged)
+    def volume(self):
+        """当前音量（0-100），供 QML 显示/读取。"""
+        p = self._player
+        if p is None:
+            return 0
+        try:
+            return int(p.volume)
+        except Exception:
+            return 0
+
+    @Slot(int)
+    def adjustVolume(self, steps):
+        """按滚轮步数调节音量：steps>0 变大，<0 变小（每步 5）。
+
+        在防抖窗口的 pending 值上累加，快速滚动不丢步；40ms 后才真正写入
+        player.volume，避免每个滚轮事件都触发一次持久化/pactl。
+        """
+        if not steps:
+            return
+        p = self._player
+        if p is None:
+            return
+        try:
+            base = self._pending_volume if self._pending_volume is not None \
+                else int(p.volume)
+        except Exception:
+            base = 0
+        new_volume = max(0, min(100, int(round(base + steps * 5))))
+        if new_volume != base:
+            self._pending_volume = new_volume
+            self._wheel_timer.start()
+
+    def _flush_volume(self):
+        value = self._pending_volume
+        self._pending_volume = None
+        if value is not None and self._player is not None:
+            try:
+                self._player.volume = value
+            except Exception:
+                pass
+
+    # ---------- 锁定状态（锁定时 QML 不处理滚轮调音量） ----------
+
+    @Property(bool, notify=lockedChanged)
+    def locked(self):
+        return self._locked
+
+    def setLocked(self, locked):
+        locked = bool(locked)
+        if locked != self._locked:
+            self._locked = locked
+            self.lockedChanged.emit()
 
     # ---------- QML 暴露的属性 ----------
 
@@ -696,7 +868,7 @@ class DesktopLyrics:
       - 默认普通窗口：左键拖动（startSystemMove）或 KWin 的 Meta+左键
         强制拖动均可移动窗口；置顶由 KWin 脚本 keepAbove 保证；
       - "锁定歌词"开启：整窗点击穿透；
-      - 取消锁定：右键弹出自绘菜单（隐藏）。
+      - 取消锁定：右键弹出自绘菜单（隐藏），滚轮调节音量（每档 5）。
       - 层模式（PYMUSIC_DESKTOP_LYRIC_LAYER_SHELL=1）：窗口不可拖动
         （layer surface 无法被 KWin 移动，协议硬限制），仅能 Meta+左键
         尝试（无效），位置在窗口关闭时由 KWin 脚本查询保存。
@@ -716,6 +888,12 @@ class DesktopLyrics:
         self._kwin_pinner = _KWinPinner(WINDOW_TITLE_HINT)
         self._position_receiver = _PositionReceiver(
             self._on_kwin_reported_position, None)
+
+        # Hyprland：平铺合成器会平铺普通窗口，首次展开后借 hyprctl 切为浮动
+        self._hypr_float = _HyprlandFloater(WINDOW_TITLE_HINT, WINDOW_CLASS_HINT)
+        self._hypr_float_supported = self._hypr_float.is_hyprland()
+        self._hypr_float_started = False   # 是否已启动过浮动重试线程
+        self._hypr_floated = False         # 是否已成功切为浮动
 
         # 客户端跟踪的窗口位置（合成器真相的副本）：层模式关闭时脚本
         # 匹配与兜底保存用。普通模式由 view 坐标/KWin 回调维护。
@@ -1282,6 +1460,11 @@ class DesktopLyrics:
             self._view.requestUpdate()
         except Exception:
             pass
+        # 同步给 QML 桥接对象：锁定状态下 QML 侧不处理滚轮调音量
+        try:
+            self._bridge.setLocked(self._locked)
+        except Exception:
+            pass
 
     def set_locked(self, locked):
         """设置"锁定歌词"状态：locked 为真时窗口点击穿透、不可挪动。"""
@@ -1322,6 +1505,31 @@ class DesktopLyrics:
         self._place_desired_after_show()
         self._schedule_restore()
         self._schedule_keep_above()
+        self._schedule_hyprland_float()
+
+    def _schedule_hyprland_float(self):
+        """Hyprland：首次展开后把窗口切为浮动（平铺合成器默认会平铺）。
+
+        只做一次；窗口 show 后需几百毫秒才被合成器注册，放到后台线程里
+        按 0.5/1.2/1.9s 重试，避免阻塞 UI。非 Hyprland 直接跳过。
+        """
+        if not self._hypr_float_supported or self._hypr_float_started:
+            return
+        self._hypr_float_started = True
+        import threading
+        threading.Thread(target=self._hyprland_float_worker, daemon=True).start()
+
+    def _hyprland_float_worker(self):
+        # 首次失败后隔 0.7s 重试：Hyprland 注册窗口有延迟
+        for i in range(3):
+            time.sleep(0.5 if i == 0 else 0.7)
+            if self._hypr_floated:
+                return
+            if self._hypr_float.ensure_floating():
+                self._hypr_floated = True
+                _dlog("_hyprland_float_worker: 桌面歌词已切为浮动")
+                return
+        _dlog("_hyprland_float_worker: 3 次尝试后仍未成功切为浮动")
 
     def hide(self):
         _dlog("hide() 调用")

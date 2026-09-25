@@ -133,6 +133,8 @@ Item {
 
     // 当前块 & 滚动位置
     property int curGroup: player ? player.curGroup : -1
+    // 滚轮累计量：鼠标一格 120，触控板是连续小值，累计到 ±120 再调一档
+    property real _wheelAccum: 0
     onCurGroupChanged: _onGroupChanged()
     // scrollY 是纯目标值（无 Behavior），_onGroupChanged 即时更新；
     // content 的滚动动画由其自身的 Behavior on y 提供。
@@ -209,6 +211,30 @@ Item {
                     player.dragFinished()
                 }
             }
+        }
+    }
+
+    // 非锁定状态下：滚轮调节音量（每档 5，与主界面一致）。
+    // 锁定状态整窗点击穿透，本层收不到事件；这里再用 player.locked 兜底。
+    // 触控板连续滚动累计到 ±120 才调一档，避免每帧写 pactl。
+    WheelHandler {
+        acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+        enabled: player ? !player.locked : false
+        onWheel: (event) => {
+            if (!player)
+                return
+            root._wheelAccum += event.angleDelta.y
+            var step = 120
+            if (root._wheelAccum >= step) {
+                var up = Math.floor(root._wheelAccum / step)
+                root._wheelAccum -= up * step
+                player.adjustVolume(up)
+            } else if (root._wheelAccum <= -step) {
+                var down = Math.ceil(root._wheelAccum / step)
+                root._wheelAccum -= down * step
+                player.adjustVolume(down)
+            }
+            event.accepted = true
         }
     }
 }

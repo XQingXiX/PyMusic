@@ -1296,7 +1296,7 @@ ApplicationWindow {
                                 // 不能用于与播放索引比较
                                 color: {
                                     if (modelData.index === player.currentIndex) return Qt.rgba(0.913, 0.271, 0.376, 0.15)
-                                    if (mouseArea.containsMouse) return Qt.rgba(1, 1, 1, 0.04)
+                                    if (mouseArea.containsMouse || rowActions.visible) return Qt.rgba(1, 1, 1, 0.04)
                                     return "transparent"
                                 }
                                 Behavior on color { ColorAnimation { duration: 120 } }
@@ -1347,6 +1347,70 @@ ApplicationWindow {
                                         player.currentIndex = modelData.index
                                         window.switchToLyric()
                                         player.play()
+                                    }
+                                }
+
+                                // 悬停时浮现的编辑/删除操作。声明在整行 MouseArea
+                                // 之后，栈序更高，因此按钮点击不会触发整行的播放。
+                                Row {
+                                    id: rowActions
+                                    anchors.right: parent.right
+                                    anchors.rightMargin: 16
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    spacing: 6
+                                    z: 2
+                                    visible: mouseArea.containsMouse
+                                             || editRowMouse.containsMouse
+                                             || deleteRowMouse.containsMouse
+
+                                    Item {
+                                        width: 22
+                                        height: 22
+                                        Image {
+                                            id: editRowIcon
+                                            anchors.fill: parent
+                                            source: "icons/edit.svg"
+                                            sourceSize.width: 18
+                                            sourceSize.height: 18
+                                            visible: false
+                                        }
+                                        ColorOverlay {
+                                            anchors.fill: editRowIcon
+                                            source: editRowIcon
+                                            color: editRowMouse.containsMouse ? accent : textSecondary
+                                        }
+                                        MouseArea {
+                                            id: editRowMouse
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: renameDialog.openFor(modelData.index)
+                                        }
+                                    }
+
+                                    Item {
+                                        width: 22
+                                        height: 22
+                                        Image {
+                                            id: deleteRowIcon
+                                            anchors.fill: parent
+                                            source: "icons/delete.svg"
+                                            sourceSize.width: 18
+                                            sourceSize.height: 18
+                                            visible: false
+                                        }
+                                        ColorOverlay {
+                                            anchors.fill: deleteRowIcon
+                                            source: deleteRowIcon
+                                            color: deleteRowMouse.containsMouse ? "#e94560" : textSecondary
+                                        }
+                                        MouseArea {
+                                            id: deleteRowMouse
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: deleteDialog.openFor(modelData.index, modelData.name)
+                                        }
                                     }
                                 }
                             }
@@ -1467,9 +1531,14 @@ ApplicationWindow {
                                         width: player.cardSize
                                         height: player.cardSize
 
-                                        // 悬停放大 1.1x，并抬升到相邻卡片之上
-                                        scale: cardMouse.containsMouse ? 1.1 : 1.0
-                                        z: cardMouse.containsMouse ? 1 : 0
+                                        // 悬停放大 1.1x，并抬升到相邻卡片之上。
+                                        // 含"移到右上角操作按钮上"的情形，避免鼠标
+                                        // 移到按钮上时 cardMouse 丢失 hover 导致缩放抖动。
+                                        property bool _hovered: cardMouse.containsMouse
+                                                               || editCardMouse.containsMouse
+                                                               || deleteCardMouse.containsMouse
+                                        scale: _hovered ? 1.1 : 1.0
+                                        z: _hovered ? 1 : 0
                                         Behavior on scale {
                                             NumberAnimation { duration: 500; easing.type: Easing.OutCubic }
                                         }
@@ -1642,6 +1711,72 @@ ApplicationWindow {
                                                 }
                                             }
                                         }
+
+                                        // 悬停时浮现的编辑/删除操作（卡片右上角）。
+                                        // 位于封面/标签之外，不受圆角遮罩裁剪影响。
+                                        Row {
+                                            id: cardActions
+                                            anchors.top: parent.top
+                                            anchors.right: parent.right
+                                            anchors.margins: 4
+                                            spacing: 4
+                                            z: 5
+                                            visible: _hovered
+
+                                            Rectangle {
+                                                width: 24
+                                                height: 24
+                                                radius: 12
+                                                color: Qt.rgba(0, 0, 0, 0.45)
+                                                Image {
+                                                    id: editCardIcon
+                                                    anchors.centerIn: parent
+                                                    source: "icons/edit.svg"
+                                                    sourceSize.width: 16
+                                                    sourceSize.height: 16
+                                                    visible: false
+                                                }
+                                                ColorOverlay {
+                                                    anchors.fill: editCardIcon
+                                                    source: editCardIcon
+                                                    color: editCardMouse.containsMouse ? accent : "#f2f2f2"
+                                                }
+                                                MouseArea {
+                                                    id: editCardMouse
+                                                    anchors.fill: parent
+                                                    hoverEnabled: true
+                                                    cursorShape: Qt.PointingHandCursor
+                                                    onClicked: renameDialog.openFor(modelData.index)
+                                                }
+                                            }
+
+                                            Rectangle {
+                                                width: 24
+                                                height: 24
+                                                radius: 12
+                                                color: Qt.rgba(0, 0, 0, 0.45)
+                                                Image {
+                                                    id: deleteCardIcon
+                                                    anchors.centerIn: parent
+                                                    source: "icons/delete.svg"
+                                                    sourceSize.width: 16
+                                                    sourceSize.height: 16
+                                                    visible: false
+                                                }
+                                                ColorOverlay {
+                                                    anchors.fill: deleteCardIcon
+                                                    source: deleteCardIcon
+                                                    color: deleteCardMouse.containsMouse ? "#ff6b81" : "#f2f2f2"
+                                                }
+                                                MouseArea {
+                                                    id: deleteCardMouse
+                                                    anchors.fill: parent
+                                                    hoverEnabled: true
+                                                    cursorShape: Qt.PointingHandCursor
+                                                    onClicked: deleteDialog.openFor(modelData.index, modelData.name)
+                                                }
+                                            }
+                                        }
                                     }
                                 }
 
@@ -1775,6 +1910,49 @@ ApplicationWindow {
                                     ToolTip {
                                         visible: parent.lyricSlowerHover
                                         text: "歌词延后 0.3 秒（写入文件）"
+                                        delay: 500
+                                    }
+                                }
+
+                                // 删除当前歌曲（复用删除确认弹窗；无当前歌曲时隐藏）
+                                Rectangle {
+                                    visible: player.currentIndex >= 0
+                                    width: 24
+                                    height: 24
+                                    radius: 12
+                                    color: lyricDeleteHover
+                                        ? Qt.rgba(0.913, 0.271, 0.376, 0.2)
+                                        : "transparent"
+
+                                    property bool lyricDeleteHover: false
+
+                                    Image {
+                                        id: lyricDeleteIcon
+                                        anchors.centerIn: parent
+                                        width: 14
+                                        height: 14
+                                        source: "icons/delete.svg"
+                                        sourceSize.width: 14
+                                        sourceSize.height: 14
+                                        visible: false
+                                    }
+                                    ColorOverlay {
+                                        anchors.fill: lyricDeleteIcon
+                                        source: lyricDeleteIcon
+                                        color: lyricDeleteHover ? "#ff6b81" : "#e94560"
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: deleteDialog.openFor(player.currentIndex,
+                                                                        player.currentSongName)
+                                        onEntered: parent.lyricDeleteHover = true
+                                        onExited: parent.lyricDeleteHover = false
+                                    }
+                                    ToolTip {
+                                        visible: parent.lyricDeleteHover
+                                        text: "删除当前歌曲"
                                         delay: 500
                                     }
                                 }
@@ -4759,6 +4937,294 @@ ApplicationWindow {
                     contentItem: Text {
                         text: parent.text
                         color: enabled ? "#fff" : textMuted
+                        font: parent.font
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+            }
+        }
+    }
+
+    // ===== 重命名歌曲对话框 =====
+    Dialog {
+        id: renameDialog
+        modal: true
+        width: 380
+        height: 220
+        padding: 0
+
+        property int targetIndex: -1
+        property string errorText: ""
+
+        function openFor(idx) {
+            renameDialog.targetIndex = idx
+            renameDialog.errorText = ""
+            // 用真实文件名（不含扩展名）预填，而不是列表显示名——
+            // 显示名可能来自内嵌元数据，与磁盘文件名不一致。
+            var p = player.songPath(idx)
+            var base = p ? p.replace(/^.*[\\/]/, "").replace(/\.[^.]+$/, "") : ""
+            renameInput.text = base
+            renameDialog.open()
+            renameInput.forceActiveFocus()
+            renameInput.selectAll()
+        }
+
+        background: Rectangle {
+            color: Qt.rgba(bgDark.r, bgDark.g, bgDark.b, 1)
+            radius: 8
+        }
+
+        header: Rectangle {
+            implicitHeight: 44
+            color: "transparent"
+            Text {
+                font.family: window.uiFontFamily
+                anchors.centerIn: parent
+                text: "重命名歌曲"
+                color: textPrimary
+                font.pixelSize: 15
+                font.bold: true
+            }
+        }
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 16
+            spacing: 10
+
+            TextField {
+                id: renameInput
+                Layout.fillWidth: true
+                placeholderText: "新文件名（不含扩展名）"
+                color: textPrimary
+                font.pixelSize: 13
+                selectByMouse: true
+                onTextChanged: renameDialog.errorText = ""
+                onAccepted: confirmRenameButton.clicked()
+                background: Rectangle {
+                    color: customBtnBg !== "" ? customBtnBg : "#1a1a3e"
+                    radius: 6
+                    border.color: renameDialog.errorText !== "" ? "#e94560" : "#334466"
+                }
+            }
+
+            Text {
+                Layout.fillWidth: true
+                visible: renameDialog.errorText !== ""
+                text: renameDialog.errorText
+                color: "#e94560"
+                font.pixelSize: 11
+                wrapMode: Text.WordWrap
+            }
+
+            Item { Layout.fillHeight: true }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+                Item { Layout.fillWidth: true }
+                Button {
+                    text: "取消"
+                    font.pixelSize: 12
+                    onClicked: renameDialog.reject()
+                    background: Rectangle {
+                        implicitWidth: 60
+                        implicitHeight: 28
+                        color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
+                        radius: 6
+                    }
+                    contentItem: Text {
+                        text: parent.text
+                        color: textSecondary
+                        font: parent.font
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                Button {
+                    id: confirmRenameButton
+                    text: "确定"
+                    font.pixelSize: 12
+                    enabled: renameInput.text.trim() !== ""
+                    onClicked: {
+                        if (player.renameSong(renameDialog.targetIndex, renameInput.text.trim()))
+                            renameDialog.accept()
+                        else
+                            renameDialog.errorText = "重命名失败：名称为空、非法或目标文件已存在"
+                    }
+                    background: Rectangle {
+                        implicitWidth: 60
+                        implicitHeight: 28
+                        color: enabled ? accent : "#3a3a5e"
+                        radius: 6
+                    }
+                    contentItem: Text {
+                        text: parent.text
+                        color: enabled ? "#fff" : textMuted
+                        font: parent.font
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+            }
+        }
+    }
+
+    // ===== 删除歌曲确认对话框 =====
+    Dialog {
+        id: deleteDialog
+        modal: true
+        width: 380
+        height: 250
+        padding: 0
+        // 从整个界面左上角下拉下来：定位到左上角，进入时从界面上方滑入
+        x: 0
+        y: 0
+
+        property int targetIndex: -1
+        property string targetName: ""
+        property string errorText: ""
+
+        function openFor(idx, name) {
+            deleteDialog.targetIndex = idx
+            deleteDialog.targetName = name || ""
+            deleteDialog.errorText = ""
+            deleteDialog.open()
+        }
+
+        // 打开：从界面上方（负 y，画面之外）下拉到左上角，同时淡入
+        enter: Transition {
+            ParallelAnimation {
+                NumberAnimation { property: "opacity"; from: 0.0; to: 1.0; duration: 160; easing.type: Easing.OutCubic }
+                NumberAnimation { property: "y"; from: -deleteDialog.height; to: 0; duration: 260; easing.type: Easing.OutCubic }
+            }
+        }
+        // 关闭：向上收回画面之外并淡出
+        exit: Transition {
+            ParallelAnimation {
+                NumberAnimation { property: "opacity"; from: 1.0; to: 0.0; duration: 160; easing.type: Easing.InCubic }
+                NumberAnimation { property: "y"; from: 0; to: -deleteDialog.height; duration: 200; easing.type: Easing.InCubic }
+            }
+        }
+
+        // 毛玻璃半透明：深色底随 panelOpacity 半透明，透出背后已模糊的封面；
+        // 叠一圈细边框 + 顶部高光，营造玻璃质感。panelOpacity 过低时 clamp
+        // 一个下限，避免文字失去可读性。
+        background: Item {
+            Rectangle {
+                anchors.fill: parent
+                radius: 12
+                color: Qt.rgba(bgDark.r, bgDark.g, bgDark.b,
+                               Math.min(0.85, Math.max(0.55, panelOpacity)))
+                border.width: 1
+                border.color: Qt.rgba(1, 1, 1, 0.14)
+
+                // 顶部玻璃高光，模拟光线在磨砂玻璃上的反射
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    height: parent.height * 0.45
+                    radius: parent.radius
+                    gradient: Gradient {
+                        GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.10) }
+                        GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.0) }
+                    }
+                }
+            }
+        }
+
+        // 弹窗出现时除弹窗外的界面整体变暗 25%
+        Overlay.modal: Rectangle {
+            color: Qt.rgba(0, 0, 0, 0.25)
+        }
+
+        header: Rectangle {
+            implicitHeight: 44
+            color: "transparent"
+            Text {
+                font.family: window.uiFontFamily
+                anchors.centerIn: parent
+                text: "删除歌曲"
+                color: textPrimary
+                font.pixelSize: 15
+                font.bold: true
+            }
+        }
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 16
+            spacing: 10
+
+            Text {
+                Layout.fillWidth: true
+                text: "确定要删除《" + deleteDialog.targetName + "》吗？"
+                color: textPrimary
+                font.pixelSize: 13
+                wrapMode: Text.WordWrap
+            }
+
+            Text {
+                Layout.fillWidth: true
+                text: "将同时删除磁盘上的歌曲文件、歌词与封面（含 .bak 备份），此操作不可恢复。"
+                color: textMuted
+                font.pixelSize: 11
+                wrapMode: Text.WordWrap
+            }
+
+            Text {
+                Layout.fillWidth: true
+                visible: deleteDialog.errorText !== ""
+                text: deleteDialog.errorText
+                color: "#e94560"
+                font.pixelSize: 11
+                wrapMode: Text.WordWrap
+            }
+
+            Item { Layout.fillHeight: true }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+                Item { Layout.fillWidth: true }
+                Button {
+                    text: "取消"
+                    font.pixelSize: 12
+                    onClicked: deleteDialog.reject()
+                    background: Rectangle {
+                        implicitWidth: 60
+                        implicitHeight: 28
+                        color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
+                        radius: 6
+                    }
+                    contentItem: Text {
+                        text: parent.text
+                        color: textSecondary
+                        font: parent.font
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                Button {
+                    text: "删除"
+                    font.pixelSize: 12
+                    onClicked: {
+                        if (player.deleteSong(deleteDialog.targetIndex))
+                            deleteDialog.accept()
+                        else
+                            deleteDialog.errorText = "删除失败：文件可能已被占用或没有权限"
+                    }
+                    background: Rectangle {
+                        implicitWidth: 60
+                        implicitHeight: 28
+                        color: "#e94560"
+                        radius: 6
+                    }
+                    contentItem: Text {
+                        text: parent.text
+                        color: "#fff"
                         font: parent.font
                         horizontalAlignment: Text.AlignHCenter
                         verticalAlignment: Text.AlignVCenter
