@@ -703,7 +703,9 @@ class AudioPlayer(QObject):
                           "desktopLyricsEnabled", "desktopLyricLocked"}
     _NUMERIC_SETTING_KEYS = {"volume", "sortMode", "blurRadius", "panelOpacity",
                              "rowSpacing", "lastPosition", "playMode",
-                             "cardSize", "listStyle"}
+                             "cardSize", "listStyle",
+                             "settingsWinW", "settingsWinH",
+                             "downloadWinW", "downloadWinH"}
 
     # Signals emitted to QML
     positionChanged = Signal(float)  # current position in seconds
@@ -2703,6 +2705,11 @@ class AudioPlayer(QObject):
             "customFontFamily": "",
             "volume": 50,
             "closeToTray": True,
+            # 独立窗口（设置/下载）的尺寸：0 表示尚未保存过，由 QML 用默认值
+            "settingsWinW": 0,
+            "settingsWinH": 0,
+            "downloadWinW": 0,
+            "downloadWinH": 0,
         }
         try:
             if self._config_file.exists():
